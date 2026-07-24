@@ -1,6 +1,25 @@
 import { server } from './stellar';
 import config from '../config';
-import { getDb, getLastLedger, setLastLedger, upsertPlayer, updatePlayerProgress } from '../db';
+import {
+  getDb,
+  getLastLedger,
+  setLastLedger,
+  upsertPlayer,
+  updatePlayerProgress,
+  getEvents,
+  insertPendingMilestone,
+} from '../db';
+import { dispatchEventWebhook } from './webhooks';
+import { logger } from '../utils/logger';
+import { tierForApprovedMilestones } from './tierPromotion';
+
+/** Current indexer lag in ledgers (latestChainLedger - lastIndexedLedger). Reset after each poll. */
+export let indexerLedgerLag = 0;
+
+/** Threshold in ledgers above which a warning is logged. Configurable via INDEXER_LAG_WARN_THRESHOLD. */
+function getLagWarnThreshold(): number {
+  return parseInt(process.env.INDEXER_LAG_WARN_THRESHOLD ?? '100', 10);
+}
 
 // ─── Payload normalisation ────────────────────────────────────────────────────
 //
@@ -55,7 +74,7 @@ function onAfterInsert(_eventId: string): void { /* hook */ }
 export async function indexEvents(): Promise<void> {
   const db = getDb();
   const insert = db.prepare(
-    'INSERT OR IGNORE INTO events (type, ledger, tx_hash, payload) VALUES (?, ?, ?, ?)'
+    'INSERT OR IGNORE INTO events (type, ledger, tx_hash, payload, created_at) VALUES (?, ?, ?, ?, ?)'
   );
 
   const fromLedger = getLastLedger();
@@ -65,15 +84,28 @@ export async function indexEvents(): Promise<void> {
     filters: [{ type: 'contract', contractIds: [config.contractId] }],
   });
 
+  const lagAfterPoll = Math.max(0, response.latestLedger - (fromLedger > 0 ? fromLedger - 1 : response.latestLedger));
+  indexerLedgerLag = lagAfterPoll;
+  const threshold = getLagWarnThreshold();
+  if (lagAfterPoll > threshold) {
+    logger.warn(`[indexer] ledger lag=${lagAfterPoll} exceeds threshold=${threshold}`);
+  }
+
   if (!response.events.length) return;
+
+  const webhookEvents: Array<{ type: string; payload: unknown }> = [];
 
   const insertMany = db.transaction((events: typeof response.events) => {
     for (const raw of events) {
       const type = raw.topic[0]?.value() as string;
       const payload = normalizePayload((raw.value?.value() as unknown as Record<string, unknown>) ?? {});
       const eventId = normalizeEventId(config.contractId, raw.ledger, raw.txHash);
+      // Use ledger close time when available (seconds → ms), otherwise index time.
+      const createdAt = raw.ledgerClosedAt
+        ? new Date(raw.ledgerClosedAt).getTime()
+        : Date.now();
       onBeforeInsert(eventId);
-      insert.run(type, raw.ledger, raw.txHash, JSON.stringify(payload));
+      insert.run(type, raw.ledger, raw.txHash, JSON.stringify(payload), createdAt);
       onAfterInsert(eventId);
 
       if (type === 'player_registered') {
@@ -85,16 +117,129 @@ export async function indexEvents(): Promise<void> {
           metadata_uri: payload.metadata_uri as string | undefined,
           created_at: raw.ledger,
         });
+      } else if (type === 'milestone_submitted') {
+        // Insert into pending_milestones
+        const milestoneId = payload.milestone_id as string;
+        const playerId = payload.player_id as string;
+        const validatorWallet = payload.validator as string;
+        const milestoneType = payload.milestone_type as string;
+        const evidenceUri = payload.evidence_uri as string;
+        const submittedAt = raw.ledger;
+        if (milestoneId && playerId && validatorWallet) {
+          insertPendingMilestone(milestoneId, playerId, validatorWallet, milestoneType, evidenceUri, submittedAt);
+        }
+        webhookEvents.push({ type, payload });
       } else if (type === 'milestone_approved') {
         const playerId = payload.player_id as string;
-        const level = Number(payload.progress_level ?? 0);
-        if (playerId) updatePlayerProgress(playerId, level);
+        if (playerId) {
+          // Tier promotion (#359): derive the player's tier from the total number
+          // of approved milestones now recorded for them, rather than trusting a
+          // progress_level field on the event payload. The just-inserted event is
+          // already part of this count (same transaction), and replays are safe
+          // because the events table dedups on tx_hash.
+          const approvedMilestoneCount = getEvents('milestone_approved').filter(
+            (e) => e.payload.player_id === playerId,
+          ).length;
+          updatePlayerProgress(playerId, tierForApprovedMilestones(approvedMilestoneCount));
+        }
+        webhookEvents.push({ type, payload });
       }
     }
   });
 
   insertMany(response.events);
 
+  for (const { type, payload } of webhookEvents) {
+    dispatchEventWebhook(type, payload).catch((err: unknown) => {
+      logger.warn(`[indexer] webhook dispatch failed for ${type}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
   const latest = response.events.at(-1)!;
   setLastLedger(latest.ledger + 1);
+  indexerLedgerLag = Math.max(0, response.latestLedger - latest.ledger);
 }
+
+// ─── Trial offer event log (#285) ──────────────────────────────────────────────
+
+export interface TrialOfferEventRow {
+  scout_wallet: string;
+  player_id: string;
+  details_uri: string;
+  tx_hash: string;
+  created_at: number;
+}
+
+/**
+ * Persist an on-chain trial offer submission. Deduped by tx_hash (INSERT OR
+ * IGNORE) so replaying the same on-chain event never creates duplicate rows.
+ */
+export function insertTrialOffer(
+  scoutWallet: string,
+  playerId: string,
+  detailsUri: string,
+  txHash: string,
+  createdAt: number,
+): void {
+  getDb().prepare(
+    `INSERT OR IGNORE INTO trial_offer_events (scout_wallet, player_id, details_uri, tx_hash, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(scoutWallet, playerId, detailsUri, txHash, createdAt);
+}
+
+/** Return all trial offer events for a scout wallet, most recent first. */
+export function getTrialOffers(scoutWallet: string): TrialOfferEventRow[] {
+  return getDb().prepare(
+    `SELECT scout_wallet, player_id, details_uri, tx_hash, created_at
+     FROM trial_offer_events WHERE scout_wallet = ? ORDER BY created_at DESC`
+  ).all(scoutWallet) as TrialOfferEventRow[];
+}
+
+// ─── Validator registry helpers ───────────────────────────────────────────────
+
+export interface ValidatorRow {
+  wallet: string;
+  registered_at: number;
+  revoked_at: number | null;
+  tx_hash: string | null;
+}
+
+/**
+ * Insert a newly registered validator into the local DB.
+ * Uses INSERT OR REPLACE so a re-registration after revocation resets the row.
+ */
+export function insertValidator(wallet: string, txHash?: string): void {
+  getDb().prepare(
+    `INSERT OR REPLACE INTO validators (wallet, registered_at, revoked_at, tx_hash)
+     VALUES (?, ?, NULL, ?)`
+  ).run(wallet, Math.floor(Date.now() / 1000), txHash ?? null);
+}
+
+/**
+ * Mark an existing validator as revoked by setting revoked_at.
+ * No-op if the wallet is not found.
+ */
+export function revokeValidatorRow(wallet: string, txHash?: string): void {
+  getDb().prepare(
+    `UPDATE validators SET revoked_at = ?, tx_hash = ? WHERE wallet = ?`
+  ).run(Math.floor(Date.now() / 1000), txHash ?? null, wallet);
+}
+
+/**
+ * Return all validator rows ordered by registration time descending.
+ */
+export function getAllValidators(): ValidatorRow[] {
+  return getDb().prepare(
+    `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators ORDER BY registered_at DESC`
+  ).all() as ValidatorRow[];
+}
+
+/**
+ * Return a single validator row by wallet address, or null if not found.
+ */
+export function getValidatorByWallet(wallet: string): ValidatorRow | null {
+  return (getDb().prepare(
+    `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators WHERE wallet = ?`
+  ).get(wallet) as ValidatorRow | undefined) ?? null;
+}
+

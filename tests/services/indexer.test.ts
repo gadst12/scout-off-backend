@@ -1,4 +1,4 @@
-import { getEvents, upsertPlayer, updatePlayerProgress, getPlayerById, queryPlayers } from '../../src/db';
+import { getDb, getEvents, getLastLedger, setLastLedger, upsertPlayer, updatePlayerProgress, getPlayerById, queryPlayers } from '../../src/db';
 import { normalizeEventId, normalizePayload } from '../../src/services/indexer';
 
 describe('indexer', () => {
@@ -87,5 +87,53 @@ describe('player table helpers', () => {
     expect(results.some((r) => r.player_id === PLAYER_ID)).toBe(true);
     const belowTier = queryPlayers({ minTier: 4 });
     expect(belowTier.some((r) => r.player_id === PLAYER_ID)).toBe(false);
+  });
+});
+
+// ─── Idempotent re-indexing ───────────────────────────────────────────────────
+
+describe('idempotent re-indexing', () => {
+  const TX_HASH = 'tx-reindex-test-' + Math.random().toString(36).slice(2);
+
+  it('INSERT OR IGNORE deduplicates events with the same tx_hash', () => {
+    const db = getDb();
+    const insert = db.prepare(
+      'INSERT OR IGNORE INTO events (type, ledger, tx_hash, payload) VALUES (?, ?, ?, ?)'
+    );
+
+    // Insert once
+    insert.run('player_registered', 100, TX_HASH, '{}');
+    const countAfterFirst = getEvents('player_registered').length;
+
+    // Replay — same tx_hash must be silently ignored
+    insert.run('player_registered', 100, TX_HASH, '{}');
+    const countAfterReplay = getEvents('player_registered').length;
+
+    expect(countAfterReplay).toBe(countAfterFirst);
+  });
+
+  it('setLastLedger / getLastLedger round-trips correctly', () => {
+    setLastLedger(5_000_000);
+    expect(getLastLedger()).toBe(5_000_000);
+
+    // Simulating a backfill reset
+    setLastLedger(4_999_000);
+    expect(getLastLedger()).toBe(4_999_000);
+  });
+
+  it('replaying different tx_hashes at the same ledger inserts both', () => {
+    const hash1 = 'tx-dedup-a-' + Math.random().toString(36).slice(2);
+    const hash2 = 'tx-dedup-b-' + Math.random().toString(36).slice(2);
+    const db = getDb();
+    const insert = db.prepare(
+      'INSERT OR IGNORE INTO events (type, ledger, tx_hash, payload) VALUES (?, ?, ?, ?)'
+    );
+
+    const before = getEvents().length;
+    insert.run('scout_subscribed', 200, hash1, '{}');
+    insert.run('scout_subscribed', 200, hash2, '{}');
+    const after = getEvents().length;
+
+    expect(after).toBe(before + 2);
   });
 });

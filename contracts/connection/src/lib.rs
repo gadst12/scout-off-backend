@@ -462,6 +462,63 @@ mod tests {
     }
 
     #[test]
+    fn invariant_trial_offer_logging_is_idempotent_and_non_decreasing() {
+        let env = Env::default();
+        let (conn_client, reg_client, sub_client, _admin) = setup(&env);
+
+        let scout = Address::generate(&env);
+        let wallet = Address::generate(&env);
+        let player_id = reg_client.register_player(
+            &wallet,
+            &String::from_str(&env, "ipfs://meta"),
+            &String::from_str(&env, "forward"),
+            &String::from_str(&env, "europe"),
+        );
+
+        let mut has_logged_offer = false;
+        let mut state = 0x1234_abcd_u64;
+        for step in 0..24 {
+            match state % 3 {
+                0 => {
+                    let duration = ((state >> 5) % 4 + 1) as u32;
+                    sub_client.subscribe(&scout, &1u32, &duration);
+                }
+                1 => {
+                    sub_client.pay_to_contact(&scout, &player_id);
+                }
+                _ => {}
+            }
+
+            let before_len = conn_client.get_connections(&player_id).len();
+            let before_level = reg_client.get_player(&player_id).progress_level;
+            let result = conn_client.try_log_trial_offer(
+                &scout,
+                &player_id,
+                &String::from_str(&env, "ipfs://offer"),
+            );
+            let after_len = conn_client.get_connections(&player_id).len();
+            let after_level = reg_client.get_player(&player_id).progress_level;
+
+            if result.is_ok() {
+                if has_logged_offer {
+                    assert_eq!(after_len, before_len, "duplicate offer should not duplicate state");
+                } else {
+                    assert_eq!(after_len, before_len + 1, "first successful offer should add a connection");
+                    has_logged_offer = true;
+                }
+                assert!(after_level >= before_level, "progress should not decrease after a successful offer");
+            } else {
+                assert_eq!(after_len, before_len, "failed offer must not mutate connections");
+                assert_eq!(after_level, before_level, "failed offer must not mutate progress");
+            }
+
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
+    }
+
+    #[test]
     fn double_initialize_fails() {
         let env = Env::default();
         let (conn_client, _reg_client, _sub_client, admin) = setup(&env);

@@ -7,7 +7,13 @@ const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 jest.mock('../../src/db', () => ({
   getEvents: jest.fn().mockReturnValue([]),
   queryPlayers: jest.fn().mockReturnValue([]),
+  countPlayers: jest.fn().mockReturnValue(0),
   getPlayerById: jest.fn().mockReturnValue(null),
+  insertPlayerProfileHistory: jest.fn(),
+  getPlayerProfileHistory: jest.fn().mockReturnValue([]),
+  getLatestSubscription: jest.fn().mockReturnValue(null),
+  insertSubscription: jest.fn().mockReturnValue(1),
+  upsertPlayer: jest.fn(),
 }));
 
 jest.mock('../../src/services/indexer', () => ({
@@ -18,6 +24,7 @@ jest.mock('../../src/services/indexer', () => ({
 jest.mock('../../src/services/ipfs', () => ({
   pinJson: jest.fn().mockResolvedValue('QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG'),
   gatewayUrl: jest.fn((cid: string) => `https://gateway.pinata.cloud/ipfs/${cid}`),
+  gatewayUrls: jest.fn((cid: string) => [`https://gateway.pinata.cloud/ipfs/${cid}`]),
 }));
 
 jest.mock('../../src/services/webhooks', () => ({
@@ -151,5 +158,78 @@ describe('PUT /api/players/:playerId — role enforcement', () => {
       .send({ position: 'midfielder' });
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
+  });
+});
+
+// ─── PUT /api/players/:playerId — owner-only enforcement ──────────────────────
+
+describe('PUT /api/players/:playerId — owner-only enforcement', () => {
+  const OWNER_WALLET = PLAYER_WALLET;
+  const OTHER_WALLET = 'G' + 'B'.repeat(55);
+  const VALID_UPDATE = { metadataUri: 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG' };
+
+  it('returns 401 when request is unauthenticated', async () => {
+    const res = await request(app)
+      .put(`/api/players/${OWNER_WALLET}`)
+      .send(VALID_UPDATE);
+    expect(res.status).toBe(401);
+    expect(res.body.success).toBe(false);
+  });
+
+  it('returns 200 when owner updates their own profile', async () => {
+    const token = makeToken(OWNER_WALLET, 'player');
+    const res = await request(app)
+      .put(`/api/players/${OWNER_WALLET}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send(VALID_UPDATE);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toBeDefined();
+  });
+
+  it('returns 403 when an authenticated player updates a different player\'s profile', async () => {
+    const token = makeToken(OTHER_WALLET, 'player');
+    const res = await request(app)
+      .put(`/api/players/${OWNER_WALLET}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send(VALID_UPDATE);
+    expect(res.status).toBe(403);
+    expect(res.body.success).toBe(false);
+  });
+});
+
+// ─── POST /api/players/register — DB write (#282) ────────────────────────────
+
+describe('POST /api/players/register — immediate DB write (#282)', () => {
+  it('calls upsertPlayer with correct fields after successful registration', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { upsertPlayer } = require('../../src/db');
+    (upsertPlayer as jest.Mock).mockClear();
+
+    const token = makeToken(PLAYER_WALLET, 'player');
+    const res = await request(app)
+      .post('/api/players/register')
+      .set('Authorization', `Bearer ${token}`)
+      .send(validPayload);
+
+    expect(res.status).toBe(201);
+    expect(upsertPlayer).toHaveBeenCalledTimes(1);
+    const call = (upsertPlayer as jest.Mock).mock.calls[0][0];
+    expect(call.wallet).toBe(PLAYER_WALLET);
+    expect(call.position).toBe('striker');
+    expect(call.region).toBe('europe');
+    expect(call.metadata_uri).toBeDefined();
+    expect(call.player_id).toBeDefined();
+  });
+
+  it('returns playerId in the response body', async () => {
+    const token = makeToken(PLAYER_WALLET, 'player');
+    const res = await request(app)
+      .post('/api/players/register')
+      .set('Authorization', `Bearer ${token}`)
+      .send(validPayload);
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.playerId).toBeDefined();
   });
 });

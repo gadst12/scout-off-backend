@@ -21,58 +21,97 @@ const REQUIRED_RUNTIME_VARS = ['CONTRACT_ID', 'JWT_SECRET'];
 // Valid NODE_ENV values; defaults to 'development' when unset.
 const VALID_NODE_ENVS = ['development', 'test', 'production'];
 
-// ─── Runtime check ────────────────────────────────────────────────────────────
-if (process.argv.includes('--runtime')) {
+function validateRuntimeEnv(env = process.env) {
   const errors = [];
 
   // Validate NODE_ENV
-  const nodeEnv = process.env.NODE_ENV ?? 'development';
+  const nodeEnv = env.NODE_ENV ?? 'development';
   if (!VALID_NODE_ENVS.includes(nodeEnv)) {
     errors.push(`NODE_ENV="${nodeEnv}" is invalid. Must be one of: ${VALID_NODE_ENVS.join(', ')}`);
   }
 
   // Validate required vars
   for (const key of REQUIRED_RUNTIME_VARS) {
-    if (!process.env[key]) {
+    if (!env[key]) {
       errors.push(`Missing required environment variable: ${key}`);
     }
   }
 
-  if (errors.length) {
-    errors.forEach(e => console.error(`[env] ERROR: ${e}`));
+  // Validate CORS_ALLOWED_ORIGINS if specified
+  const corsOriginsVal = env.CORS_ALLOWED_ORIGINS ?? env.ALLOWED_ORIGINS;
+  if (corsOriginsVal !== undefined) {
+    if (corsOriginsVal.trim() === '') {
+      errors.push('CORS_ALLOWED_ORIGINS cannot be empty when specified');
+    } else {
+      const origins = corsOriginsVal.split(',').map((s) => s.trim());
+      for (const origin of origins) {
+        if (!origin) {
+          errors.push('CORS_ALLOWED_ORIGINS contains empty origin entry');
+        } else if (origin !== '*' && !/^https?:\/\//i.test(origin)) {
+          errors.push(`Invalid CORS origin format: "${origin}". Origins must be "*" or start with http:// or https://`);
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+if (require.main === module) {
+  // ─── Runtime check ────────────────────────────────────────────────────────────
+  if (process.argv.includes('--runtime')) {
+    const errors = validateRuntimeEnv();
+
+    if (errors.length) {
+      errors.forEach(e => console.error(`[env] ERROR: ${e}`));
+      process.exit(1);
+    }
+
+    console.log('[env] All required environment variables are set ✓');
+    process.exit(0);
+  }
+
+  // ─── CI / documentation check ────────────────────────────────────────────────
+  const examplePath = path.resolve(__dirname, '../.env.example');
+  const exampleKeys = new Set(
+    fs
+      .readFileSync(examplePath, 'utf8')
+      .split('\n')
+      .filter((l) => l && !l.startsWith('#'))
+      .map((l) => l.split('=')[0].trim())
+  );
+
+  const srcFiles = fs
+    .readdirSync(path.resolve(__dirname, '../src'), { recursive: true })
+    .filter((f) => f.endsWith('.ts'))
+    .map((f) => path.resolve(__dirname, '../src', f));
+
+  const undocumented = [];
+  for (const file of srcFiles) {
+    const content = fs.readFileSync(file, 'utf8');
+    const codeOnly = content
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((line) => line.replace(/\/\/.*$/, ''))
+      .join('\n');
+    const matches = [...codeOnly.matchAll(/process\.env\.([A-Z_]+)/g)];
+    for (const [, key] of matches) {
+      if (!exampleKeys.has(key)) undocumented.push({ key, file });
+    }
+  }
+
+  if (undocumented.length) {
+    console.error('Missing from .env.example:');
+    undocumented.forEach(({ key, file }) => console.error(`  ${key}  (${file})`));
     process.exit(1);
   }
 
-  console.log('[env] All required environment variables are set ✓');
-  process.exit(0);
+  console.log('Environment validation passed ✓');
 }
 
-// ─── CI / documentation check ────────────────────────────────────────────────
-const examplePath = path.resolve(__dirname, '../.env.example');
-const exampleKeys = new Set(
-  fs.readFileSync(examplePath, 'utf8')
-    .split('\n')
-    .filter(l => l && !l.startsWith('#'))
-    .map(l => l.split('=')[0].trim())
-);
+module.exports = {
+  REQUIRED_RUNTIME_VARS,
+  VALID_NODE_ENVS,
+  validateRuntimeEnv,
+};
 
-const srcFiles = fs.readdirSync(path.resolve(__dirname, '../src'), { recursive: true })
-  .filter(f => f.endsWith('.ts'))
-  .map(f => path.resolve(__dirname, '../src', f));
-
-const missing = [];
-for (const file of srcFiles) {
-  const content = fs.readFileSync(file, 'utf8');
-  const matches = [...content.matchAll(/process\.env\.([A-Z_]+)/g)];
-  for (const [, key] of matches) {
-    if (!exampleKeys.has(key)) missing.push({ key, file });
-  }
-}
-
-if (missing.length) {
-  console.error('Missing from .env.example:');
-  missing.forEach(({ key, file }) => console.error(`  ${key}  (${file})`));
-  process.exit(1);
-}
-
-console.log('All env vars documented in .env.example ✓');
