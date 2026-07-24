@@ -1,31 +1,76 @@
 /**
- * Search cache invalidation stubs.
+ * Search cache.
  *
- * TODO (Redis): Replace the in-memory Set with a Redis client.
- *   import { createClient } from 'redis';
- *   const redis = createClient({ url: process.env.REDIS_URL });
- *   await redis.del(key);
+ * Backend is selected once at module load based on `REDIS_URL`:
+ *   - set   -> RedisCacheStore — cache state is shared across every backend
+ *              instance, so a load-balanced multi-instance deployment stays
+ *              consistent instead of each process re-hitting IPFS/DB.
+ *   - unset -> InMemoryCacheStore — process-local, zero setup. Default for
+ *              local dev and CI.
  *
  * Cache key conventions:
- *   players:list          – all paginated player search results
- *   players:<playerId>    – single player profile
+ *   players:list:<hash>  – paginated player search results (keyed by filter params)
+ *   players:<playerId>   – single player profile
  *   milestones:<playerId> – milestone list for a player
+ *
+ * All exported functions are async: Redis access is inherently network I/O,
+ * so every call site must `await` these calls (they returned void
+ * synchronously before this module supported a Redis backend).
  */
+import Redis from 'ioredis';
+import config from '../config';
+import { logger } from '../utils/logger';
+import { CacheStore } from './cacheStore';
+import { InMemoryCacheStore } from './inMemoryCacheStore';
+import { RedisCacheStore } from './redisCacheStore';
+import { recordCacheHit, recordCacheMiss } from '../middleware/metrics';
 
-const cache = new Map<string, unknown>();
+function createStore(): CacheStore {
+  if (config.redisUrl) {
+    const client = new Redis(config.redisUrl);
+    // ioredis emits 'error' on connection failures (refused connections,
+    // timeouts, etc.); an EventEmitter 'error' with no listener crashes the
+    // process, so this must be attached even though the cache is meant to
+    // degrade gracefully rather than take the backend down with it.
+    client.on('error', (err) => {
+      logger.error('[cache] Redis client error:', err);
+    });
+    return new RedisCacheStore(client);
+  }
+  return new InMemoryCacheStore();
+}
 
-export function invalidatePlayerCache(playerId?: string): void {
-  // TODO (Redis): await redis.del('players:list')
-  cache.delete('players:list');
+const store: CacheStore = createStore();
+
+/** Fetch a cached value. Returns undefined if missing or expired. */
+export async function cacheGet<T>(key: string): Promise<T | undefined> {
+  const value = await store.get<T>(key);
+  if (value !== undefined) {
+    recordCacheHit();
+  } else {
+    recordCacheMiss();
+  }
+  return value;
+}
+
+/** Store a value under `key`, expiring after `ttlMs` (default: config.playerCacheTtlMs). */
+export async function cacheSet<T>(
+  key: string,
+  value: T,
+  ttlMs: number = config.playerCacheTtlMs
+): Promise<void> {
+  await store.set(key, value, ttlMs);
+}
+
+export async function invalidatePlayerCache(playerId?: string): Promise<void> {
+  await store.deleteByPrefix('players:list');
   if (playerId) {
-    // TODO (Redis): await redis.del(`players:${playerId}`)
-    cache.delete(`players:${playerId}`);
+    await store.del(`players:${playerId}`);
   }
 }
 
-export function invalidateMilestoneCache(playerId: string): void {
-  // TODO (Redis): await redis.del(`milestones:${playerId}`)
-  cache.delete(`milestones:${playerId}`);
+export async function invalidateMilestoneCache(playerId: string): Promise<void> {
+  await store.del(`milestones:${playerId}`);
   // Also bust the player list so updated progress tier is reflected
-  invalidatePlayerCache(playerId);
+  await invalidatePlayerCache(playerId);
 }

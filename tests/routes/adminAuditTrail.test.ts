@@ -1,17 +1,25 @@
 import request from 'supertest';
-import { Keypair, Transaction, Networks } from '@stellar/stellar-sdk';
+import jwt from 'jsonwebtoken';
 import app from '../../src/app';
 import * as auditService from '../../src/services/audit';
 
+// pauseContract/unpauseContract invoke the real Soroban pause()/unpause()
+// calls unless mocked; the platform keypair isn't configured in tests, so
+// stub both out here.
+jest.mock('../../src/services/stellar', () => ({
+  ...jest.requireActual('../../src/services/stellar'),
+  pauseContractOnChain: jest.fn().mockResolvedValue({ transactionId: 'mock-pause-txid' }),
+  unpauseContractOnChain: jest.fn().mockResolvedValue({ transactionId: 'mock-unpause-txid' }),
+}));
+
+const SECRET = process.env.JWT_SECRET ?? 'test-secret';
+// pauseContract/unpauseContract additionally require the caller's wallet to be
+// in config.adminWallets (defence-in-depth beyond the admin role claim) — this
+// must match the ADMIN_WALLET default set in tests/setup.ts.
+const ADMIN_WALLET = 'GADMINAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4';
+
 async function getAdminToken(): Promise<string> {
-  const kp = Keypair.random();
-  const challengeRes = await request(app).get(`/auth/challenge?account=${kp.publicKey()}`);
-  const tx = new Transaction(challengeRes.body.challenge, Networks.TESTNET);
-  tx.sign(kp);
-  const tokenRes = await request(app)
-    .post('/auth/token')
-    .send({ transaction: tx.toXDR(), role: 'admin' });
-  return tokenRes.body.token;
+  return jwt.sign({ sub: ADMIN_WALLET, role: 'admin' }, SECRET, { expiresIn: '1h' });
 }
 
 describe('Admin contract audit trail (#101)', () => {

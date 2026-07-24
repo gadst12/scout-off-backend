@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
 import { ApiResponse } from '../types';
 import { logger } from '../utils/logger';
+import { ErrorCode } from '../utils/errorCodes';
 
 interface HttpError extends Error {
   type?: string;
@@ -23,6 +24,7 @@ export function errorHandler(
     res.status(400).json({
       success: false,
       error: 'Malformed JSON payload',
+      code: ErrorCode.MALFORMED_JSON,
       ...(correlationId !== undefined && { correlationId }),
     });
     return;
@@ -32,24 +34,27 @@ export function errorHandler(
     res.status(413).json({
       success: false,
       error: 'Payload too large',
+      code: ErrorCode.PAYLOAD_TOO_LARGE,
       ...(correlationId !== undefined && { correlationId }),
     });
     return;
   }
 
   if (err instanceof ZodError) {
-    const body: ApiResponse & { correlationId?: string } = {
+    const body: ApiResponse & { code: string; correlationId?: string } = {
       success: false,
       error: err.errors[0]?.message ?? 'Validation error',
+      code: ErrorCode.VALIDATION_ERROR,
       ...(correlationId !== undefined && { correlationId }),
     };
     res.status(400).json(body);
     return;
   }
 
-  const body: ApiResponse & { correlationId?: string } = {
+  const body: ApiResponse & { code: string; correlationId?: string } = {
     success: false,
     error: err.message,
+    code: ErrorCode.INTERNAL_SERVER_ERROR,
     ...(correlationId !== undefined && { correlationId }),
   };
   res.status(500).json(body);

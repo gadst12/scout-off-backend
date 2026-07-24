@@ -205,7 +205,7 @@ impl RegisterContract {
             .instance()
             .get(&DataKey::Player(player_id))
             .ok_or(Error::PlayerNotFound)?;
-        player.progress_level = level;
+        player.progress_level = player.progress_level.max(level);
         env.storage()
             .instance()
             .set(&DataKey::Player(player_id), &player);
@@ -373,6 +373,51 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap().wallet, w1);
+    }
+
+    #[test]
+    fn invariant_progress_levels_never_decrease_under_randomized_updates() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &100u32);
+
+        let updater = Address::generate(&env);
+        client.set_authorized_updater(&updater);
+
+        let wallet = Address::generate(&env);
+        let player_id = client.register_player(
+            &wallet,
+            &String::from_str(&env, "ipfs://meta"),
+            &String::from_str(&env, "forward"),
+            &String::from_str(&env, "europe"),
+        );
+
+        let mut previous_level = 0u32;
+        let mut state = 0x5eed_1234u64;
+        for step in 0..32 {
+            let target_player = if state % 2 == 0 { player_id } else { player_id + 1 };
+            let requested_level = ((state >> 3) % 4) as u32;
+            let result = client.try_update_progress_level(&target_player, &requested_level);
+
+            let player = client.get_player(&player_id);
+            if result.is_ok() {
+                assert!(
+                    player.progress_level >= previous_level,
+                    "step {step}: progress regressed from {previous_level} to {}",
+                    player.progress_level
+                );
+                previous_level = player.progress_level;
+            } else {
+                assert_eq!(
+                    player.progress_level, previous_level,
+                    "step {step}: failed update should not change progress"
+                );
+            }
+
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
     }
 
     #[test]
