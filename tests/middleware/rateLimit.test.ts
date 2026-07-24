@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { rateLimit } from '../../src/middleware/rateLimit';
+import { rateLimit, walletRateLimit } from '../../src/middleware/rateLimit';
 
 // ── Unit tests for rateLimit middleware ──────────────────────────────────────
 
@@ -8,6 +8,7 @@ function makeReqRes(ip = '127.0.0.1') {
   const res = {
     status: jest.fn().mockReturnThis(),
     json: jest.fn().mockReturnThis(),
+    set: jest.fn().mockReturnThis(),
   } as unknown as Response;
   const next = jest.fn() as NextFunction;
   return { req, res, next };
@@ -85,3 +86,54 @@ describe('POST /api/validators/milestone rate limiting (middleware integration)'
     expect(second.next).not.toHaveBeenCalled();
   });
 });
+
+// ── Unit tests for walletRateLimit middleware ────────────────────────────────
+describe('walletRateLimit middleware', () => {
+  function makeReqResWithWallet(wallet?: string, ip = '127.0.0.1') {
+    const req = { ip, account: wallet } as unknown as Request;
+    const res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
+    } as unknown as Response;
+    const next = jest.fn() as NextFunction;
+    return { req, res, next };
+  }
+
+  it('allows requests under the limit by wallet', () => {
+    const mw = walletRateLimit({ windowMs: 60_000, max: 3 });
+    for (let i = 0; i < 3; i++) {
+      const { req, res, next } = makeReqResWithWallet('G_WALLET_1');
+      mw(req, res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+    }
+  });
+
+  it('returns 429 when limit is exceeded by wallet', () => {
+    const mw = walletRateLimit({ windowMs: 60_000, max: 2 });
+    const wallet = 'G_WALLET_2';
+    for (let i = 0; i < 2; i++) {
+      const { req, res, next } = makeReqResWithWallet(wallet);
+      mw(req, res, next);
+    }
+    const { req, res, next } = makeReqResWithWallet(wallet);
+    mw(req, res, next);
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('ignores requests if req.account is not present', () => {
+    const mw = walletRateLimit({ windowMs: 60_000, max: 1 });
+    const { req, res, next } = makeReqResWithWallet(undefined);
+    mw(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+
+    // Call again to verify it is not blocked
+    const second = makeReqResWithWallet(undefined);
+    mw(second.req, second.res, second.next);
+    expect(second.next).toHaveBeenCalledTimes(1);
+    expect(second.res.status).not.toHaveBeenCalled();
+  });
+});
+

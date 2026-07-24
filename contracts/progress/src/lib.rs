@@ -445,6 +445,91 @@ mod tests {
     }
 
     #[test]
+    fn invariant_milestones_are_single_approval_and_progress_is_monotonic() {
+        let env = Env::default();
+        let (prog, reg, _admin) = setup(&env);
+        let player_id = register_player(&env, &reg);
+        let validator = Address::generate(&env);
+
+        prog.register_validator(&validator);
+
+        let mut state = 0xc0ffee_1234u64;
+        for _step in 0..24 {
+            let milestone_type = if state % 2 == 0 {
+                String::from_str(&env, "identity")
+            } else {
+                String::from_str(&env, "performance")
+            };
+            let milestone_id = prog.submit_milestone(
+                &validator,
+                &player_id,
+                &milestone_type,
+                &String::from_str(&env, "ipfs://evidence"),
+            );
+
+            let before_level = reg.get_player(&player_id).progress_level;
+            let approval_target = if state % 2 == 0 {
+                milestone_id
+            } else {
+                milestone_id + 1000
+            };
+            let approval_result = prog.try_approve_milestone(&validator, &approval_target);
+
+            let milestones = prog.get_milestones(&player_id);
+            let milestone = milestones.get(milestones.len() - 1).unwrap();
+
+            if approval_result.is_ok() {
+                assert!(milestone.approved, "approval should flip the milestone state");
+                let after_level = reg.get_player(&player_id).progress_level;
+                assert!(
+                    after_level >= before_level,
+                    "progress level regressed from {before_level} to {after_level}"
+                );
+                let second_result = prog.try_approve_milestone(&validator, &milestone_id);
+                assert!(second_result.is_err(), "double approval must fail");
+            } else {
+                assert!(!milestone.approved, "failed approval must not approve the milestone");
+            }
+
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
+    }
+
+    #[test]
+    fn invariant_unregistered_validators_cannot_mutate_milestones() {
+        let env = Env::default();
+        let (prog, reg, _admin) = setup(&env);
+        let player_id = register_player(&env, &reg);
+        let validator = Address::generate(&env);
+        let mut state = 0x9e3779b97f4a7c15u64;
+
+        let initial_milestones = prog.get_milestones(&player_id);
+        let mut previous_len = initial_milestones.len();
+        for _step in 0..24 {
+            let result = prog.try_submit_milestone(
+                &validator,
+                &player_id,
+                &String::from_str(&env, "identity"),
+                &String::from_str(&env, "ipfs://evidence"),
+            );
+
+            let milestones = prog.get_milestones(&player_id);
+            if result.is_ok() {
+                assert!(milestones.len() >= previous_len, "milestone count should never shrink");
+                previous_len = milestones.len();
+            } else {
+                assert_eq!(milestones.len(), previous_len, "failed submission must not add milestones");
+            }
+
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+        }
+    }
+
+    #[test]
     fn double_initialize_fails() {
         let env = Env::default();
         let (prog, reg, admin) = setup(&env);

@@ -1,0 +1,166 @@
+# Deploy ScoutOff backend to staging on every merge to main.
+#
+# Required GitHub Environment: staging
+# Configure at Settings → Environments → staging
+#
+# Secrets (scoped to the staging environment):
+#   STAGING_HOST              — staging server hostname or IP
+#   STAGING_SSH_USER          — SSH user for deployment
+#   STAGING_SSH_PRIVATE_KEY   — private key for SSH/SCP (PEM)
+#   STAGING_DEPLOY_PATH       — absolute path on the server (e.g. /var/www/scout-off-backend)
+#   STAGING_URL               — public staging base URL for smoke tests (e.g. https://api.staging.example.com)
+#   STAGING_DEPLOY_NOTIFY_WEBHOOK — (optional) Slack/Discord webhook URL for failure alerts
+#
+# Runtime env vars (CONTRACT_ID, JWT_SECRET, etc.) live in the server .env file;
+# see DEPLOYMENT.md.
+
+name: Deploy Staging
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Validate env example
+        run: node scripts/validate-env.js
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
+        env:
+          CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+          JWT_SECRET: test-secret
+          DB_PATH: ':memory:'
+
+      - name: Build
+        run: npm run build
+
+      - name: Write build commit
+        run: echo "${{ github.sha }}" > BUILD_COMMIT
+
+      - name: Package release
+        run: |
+          tar czf release.tar.gz \
+            --exclude=node_modules \
+            --exclude=.git \
+            --exclude=coverage \
+            .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: staging-release
+          path: release.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: Deploy to staging
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ secrets.STAGING_URL }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: staging-release
+
+      - name: Upload release to staging server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          source: release.tar.gz
+          target: ${{ secrets.STAGING_DEPLOY_PATH }}
+
+      - name: Extract and restart service
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          envs: DEPLOY_PATH
+          script: |
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+            tar xzf release.tar.gz
+            rm -f release.tar.gz
+            chmod +x scripts/deploy-staging.sh
+            bash scripts/deploy-staging.sh "$DEPLOY_PATH"
+
+  smoke-test:
+    name: Smoke test
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Verify GET /health
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+        run: |
+          HEALTH_URL="${STAGING_URL%/}/health"
+          echo "Smoke testing ${HEALTH_URL}"
+          for attempt in 1 2 3 4 5; do
+            body="$(curl -fsSL "$HEALTH_URL")"
+            if echo "$body" | grep -q '"status":"ok"'; then
+              echo "Health check passed: $body"
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed (body: $body); retrying in 10s..."
+            sleep 10
+          done
+          echo "Smoke test failed: GET /health did not return status ok"
+          exit 1
+
+  notify-failure:
+    name: Notify on failure
+    needs: [build, deploy, smoke-test]
+    if: >-
+      always() && (
+        needs.build.result == 'failure' ||
+        needs.deploy.result == 'failure' ||
+        needs.smoke-test.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send deployment failure notification
+        env:
+          WEBHOOK_URL: ${{ secrets.STAGING_DEPLOY_NOTIFY_WEBHOOK }}
+        run: |
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "STAGING_DEPLOY_NOTIFY_WEBHOOK not configured; skipping notification"
+            exit 0
+          fi
+          payload=$(cat <<EOF
+          {
+            "text": "Staging deployment failed for ${{ github.repository }}@${{ github.sha }}\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+          )
+          curl -fsSL -X POST "${WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d "${payload}"
