@@ -7,7 +7,80 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
   test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - run: npm ci
+
+      - name: Install sqlite3 CLI
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Validate env example
+        run: node scripts/validate-env.js
+
+      - name: Type check
+        run: node node_modules/.bin/tsc --noEmit
+
+      - name: Run tests with coverage
+        # node_modules/.bin/jest is unreliable here: jest and jest-cli are
+        # both hoisted to top-level node_modules and both declare a bin
+        # literally named "jest", so npm can't deterministically symlink it.
+        # Invoke jest's own bin script directly to sidestep the collision.
+        run: node node_modules/jest/bin/jest.js --runInBand --forceExit --coverage --coverageReporters=text --coverageReporters=lcov
+        env:
+          CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+
+      # Coverage is only representative once, so upload it from the Node
+      # version .nvmrc pins (20) to keep this identical to the prior
+      # single-version behavior instead of uploading/overwriting 3x.
+      - name: Upload coverage to Codecov
+        if: matrix.node-version == 20
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage/lcov.info
+          fail_ci_if_error: false
+
+      - name: Upload coverage report as artifact
+        if: matrix.node-version == 20
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  audit:
     runs-on: ubuntu-latest
 
     steps:
@@ -15,24 +88,16 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version-file: '.nvmrc'
 
       - run: npm ci
 
-      - name: Validate env example
-        run: node scripts/validate-env.js
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Type check
-        run: npx tsc --noEmit
-
-      - name: Run tests
-        run: npm test
-        env:
-          CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC
+      # Dev-only tooling (eslint, jest, etc.) never ships to production, so
+      # only production dependencies gate the build. See CONTRIBUTING.md's
+      # "CI Enforcement & Exception Process" for what to do when this fails
+      # on a legitimately unpatchable finding.
+      - name: Audit production dependencies (high/critical)
+        run: npm audit --omit=dev --audit-level=high
   contracts:
     name: Soroban Contracts
     runs-on: ubuntu-latest
@@ -57,7 +122,7 @@ jobs:
 
       - name: Build contracts (WASM)
         working-directory: contracts
-        run: cargo build --release
+        run: cargo build --target wasm32-unknown-unknown --release
 
       - name: Test contracts (host target)
         working-directory: contracts

@@ -11,7 +11,7 @@ jest.mock('../../src/services/stellar', () => ({
   },
 }));
 
-jest.mock('../../src/db', () => ({ getEvents: jest.fn() }));
+jest.mock('../../src/db', () => ({ getEvents: jest.fn(), insertContactUnlock: jest.fn() }));
 
 import { unlockContact } from '../../src/controllers/scoutController';
 import { submitContactPayment } from '../../src/services/stellar';
@@ -30,8 +30,8 @@ function makeRes() {
 const next = jest.fn() as unknown as NextFunction;
 
 describe('unlockContact', () => {
-  const WALLET = 'GSCOUTWALLET1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
-  const OTHER  = 'GOTHERWALLET2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const WALLET = 'GAE3BQINZGCGNDDFRJZYAWXDXBFJJALLZ47UCHMWASF56ILDAVUODSOR';
+  const OTHER  = 'GD4LQIN4652EY3VSBTQ32PY3GVKZBKRA2PN3LUUC2TL7I53COGFLWYQP';
   const PLAYER = 'player-123';
 
   beforeEach(() => {
